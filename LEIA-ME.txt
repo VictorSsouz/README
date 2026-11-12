@@ -1,0 +1,17 @@
+ESPETINHOS WEST - Codigo-fonte completo
+
+COMO RODAR:
+
+Backend (Python/FastAPI):
+  cd backend
+  pip install -r requirements.txt
+  crie um arquivo .env com: MONGO_URL, DB_NAME, CORS_ORIGINS, JWT_SECRET, ADMIN_EMAIL, ADMIN_PASSWORD
+  uvicorn server:app --host 0.0.0.0 --port 8001
+
+Frontend (React/JavaScript):
+  cd frontend
+  yarn install
+  crie um arquivo .env com: REACT_APP_BACKEND_URL e REACT_APP_WHATSAPP_NUMBER
+  yarn start
+
+Os arquivos .env NAO estao incluidos por seguranca (contem senhas e chaves).
