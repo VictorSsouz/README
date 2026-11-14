@@ -2,11 +2,18 @@ ESPETINHOS WEST - Codigo-fonte completo
 
 COMO RODAR:
 
-Backend (Python/FastAPI):
+Backend (Python/FastAPI com SQLite):
   cd backend
-  pip install -r requirements.txt
-  crie um arquivo .env com: MONGO_URL, DB_NAME, CORS_ORIGINS, JWT_SECRET, ADMIN_EMAIL, ADMIN_PASSWORD
-  uvicorn server:app --host 0.0.0.0 --port 8001
+  py -m pip install -r requirements.txt
+  crie um arquivo .env com: JWT_SECRET, ADMIN_EMAIL, ADMIN_PASSWORD, CORS_ORIGINS
+  py -m uvicorn server:app --host 0.0.0.0 --port 8001
+
+O banco local e criado em backend/app.db. Para manter os dados no Render,
+adicione um Persistent Disk montado em /var/data e configure SQLITE_DB_PATH=/var/data/app.db.
+Sem disco persistente, dados locais do Render podem ser perdidos em reinicializacoes e deploys.
+
+No Render, use Root Directory = backend, Build Command = pip install -r requirements.txt
+e Start Command = uvicorn server:app --host 0.0.0.0 --port $PORT.
 
 Frontend (React/JavaScript):
   cd frontend

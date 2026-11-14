@@ -6,8 +6,7 @@ load_dotenv(ROOT_DIR / '.env')
 
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Header
 from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo import ReturnDocument
+import asyncio
 import os
 import re
 import logging
@@ -16,13 +15,15 @@ import string
 import bcrypt
 import jwt
 from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional
+from typing import Any, Callable, List, Optional, TypeVar
 import uuid
 from datetime import datetime, timezone, timedelta
+import storage
 
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+T = TypeVar("T")
+
+async def db_call(operation: Callable[..., T], *args: Any) -> T:
+    return await asyncio.to_thread(operation, *args)
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -127,7 +128,7 @@ async def get_admin(authorization: str = Header(default="")):
         payload = jwt.decode(token, os.environ["JWT_SECRET"], algorithms=[JWT_ALGORITHM])
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Token inválido ou expirado")
-    user = await db.users.find_one({"id": payload["sub"]}, {"_id": 0, "password_hash": 0})
+    user = await db_call(storage.get_user_by_id, payload["sub"])
     if not user or user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Acesso restrito ao dono")
     return user
@@ -161,8 +162,7 @@ async def root():
 
 @api_router.get("/products", response_model=List[Product])
 async def get_products(category: Optional[str] = None):
-    query = {"category": category} if category else {}
-    return await db.products.find(query, {"_id": 0}).to_list(1000)
+    return await db_call(storage.get_products, category)
 
 @api_router.post("/orders", response_model=Order)
 async def create_order(order_in: OrderCreate):
@@ -170,12 +170,12 @@ async def create_order(order_in: OrderCreate):
         raise HTTPException(status_code=400, detail="Pedido sem itens")
     code = "EW-" + "".join(random.choices(string.digits, k=4))
     order = Order(code=code, **order_in.model_dump())
-    await db.orders.insert_one(order.model_dump())
+    await db_call(storage.insert_order, order.model_dump())
     return order
 
 @api_router.get("/orders/{code}", response_model=Order)
 async def get_order(code: str):
-    doc = await db.orders.find_one({"code": code}, {"_id": 0})
+    doc = await db_call(storage.get_order, code)
     if not doc:
         raise HTTPException(status_code=404, detail="Pedido não encontrado")
     return order_with_status(doc)
@@ -186,20 +186,16 @@ async def get_order(code: str):
 async def login(body: LoginIn):
     email = body.email.lower().strip()
     key = f"login:{email}"
-    attempts = await db.login_attempts.find_one({"key": key})
+    attempts = await db_call(storage.get_login_attempt, key)
     if attempts and attempts.get("count", 0) >= 5:
         last = attempts.get("last", datetime.now(timezone.utc))
         if (datetime.now(timezone.utc) - last).total_seconds() < 900:
             raise HTTPException(status_code=429, detail="Muitas tentativas. Tente novamente em 15 minutos.")
-    user = await db.users.find_one({"email": email}, {"_id": 0})
+    user = await db_call(storage.get_user_by_email, email)
     if not user or not verify_password(body.password, user["password_hash"]):
-        await db.login_attempts.update_one(
-            {"key": key},
-            {"$inc": {"count": 1}, "$set": {"last": datetime.now(timezone.utc)}},
-            upsert=True,
-        )
+        await db_call(storage.record_login_failure, key, datetime.now(timezone.utc))
         raise HTTPException(status_code=401, detail="Email ou senha incorretos")
-    await db.login_attempts.delete_one({"key": key})
+    await db_call(storage.clear_login_attempt, key)
     token = create_access_token(user["id"], email)
     return {"token": token, "user": {"email": email, "name": user.get("name", "Admin"), "role": user["role"]}}
 
@@ -211,19 +207,14 @@ async def me(admin=Depends(get_admin)):
 
 @api_router.get("/admin/orders", response_model=List[Order])
 async def admin_list_orders(admin=Depends(get_admin)):
-    docs = await db.orders.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    docs = await db_call(storage.get_orders)
     return [order_with_status(d) for d in docs]
 
 @api_router.patch("/admin/orders/{code}/status", response_model=Order)
 async def admin_update_status(code: str, body: StatusUpdate, admin=Depends(get_admin)):
     if body.status not in VALID_STATUSES:
         raise HTTPException(status_code=400, detail="Status inválido")
-    doc = await db.orders.find_one_and_update(
-        {"code": code},
-        {"$set": {"status_override": body.status}},
-        return_document=ReturnDocument.AFTER,
-        projection={"_id": 0},
-    )
+    doc = await db_call(storage.update_order_status, code, body.status)
     if not doc:
         raise HTTPException(status_code=404, detail="Pedido não encontrado")
     doc["status"] = body.status
@@ -232,29 +223,22 @@ async def admin_update_status(code: str, body: StatusUpdate, admin=Depends(get_a
 @api_router.post("/admin/products", response_model=Product)
 async def admin_create_product(body: ProductIn, admin=Depends(get_admin)):
     pid = slugify(body.name)
-    if await db.products.find_one({"id": pid}):
+    if await db_call(storage.product_exists, pid):
         pid = f"{pid}-{uuid.uuid4().hex[:4]}"
     doc = {"id": pid, **body.model_dump()}
-    await db.products.insert_one(doc)
-    doc.pop("_id", None)
+    await db_call(storage.insert_product, doc)
     return doc
 
 @api_router.put("/admin/products/{product_id}", response_model=Product)
 async def admin_update_product(product_id: str, body: ProductIn, admin=Depends(get_admin)):
-    doc = await db.products.find_one_and_update(
-        {"id": product_id},
-        {"$set": body.model_dump()},
-        return_document=ReturnDocument.AFTER,
-        projection={"_id": 0},
-    )
+    doc = await db_call(storage.update_product, product_id, body.model_dump())
     if not doc:
         raise HTTPException(status_code=404, detail="Produto não encontrado")
     return doc
 
 @api_router.delete("/admin/products/{product_id}")
 async def admin_delete_product(product_id: str, admin=Depends(get_admin)):
-    res = await db.products.delete_one({"id": product_id})
-    if res.deleted_count == 0:
+    if not await db_call(storage.delete_product, product_id):
         raise HTTPException(status_code=404, detail="Produto não encontrado")
     return {"ok": True}
 
@@ -270,27 +254,29 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def seed_data():
-    if await db.products.count_documents({}) == 0:
-        await db.products.insert_many(PRODUCTS)
-        logging.info("Produtos semeados: %d", len(PRODUCTS))
     admin_email = os.environ.get("ADMIN_EMAIL", "")
     admin_password = os.environ.get("ADMIN_PASSWORD", "")
-    if admin_email and not await db.users.find_one({"email": admin_email}):
-        await db.users.insert_one({
+    if bool(admin_email) != bool(admin_password):
+        raise RuntimeError("ADMIN_EMAIL e ADMIN_PASSWORD devem ser configurados juntos")
+    admin = None
+    if admin_email:
+        admin = {
             "id": str(uuid.uuid4()),
             "email": admin_email,
             "password_hash": hash_password(admin_password),
             "name": "Dono",
             "role": "admin",
             "created_at": datetime.now(timezone.utc).isoformat(),
-        })
-        logging.info("Admin semeado: %s", admin_email)
-    await db.users.create_index("email", unique=True)
-    await db.login_attempts.create_index("key")
+        }
+    if admin and not os.environ.get("JWT_SECRET"):
+        raise RuntimeError("JWT_SECRET é obrigatório quando o administrador está configurado")
+    await db_call(storage.initialize_database, PRODUCTS, admin)
+    logging.info("Banco SQLite inicializado em %s", storage.DB_PATH)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
